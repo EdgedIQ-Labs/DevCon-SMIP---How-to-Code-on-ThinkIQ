@@ -15,6 +15,8 @@
 - root object and relationship toggles to focus the view on what matters
 - download and copy buttons for the generated DOT source
 - hide controls and CSV download of the tree for downstream use
+- resize sidebar and toggle full width diagram
+- both, instance to instance, and instance to type relationships are visualized
 
 Paste the generated DOT into a Graphviz fiddle to render and tweak online:
 
