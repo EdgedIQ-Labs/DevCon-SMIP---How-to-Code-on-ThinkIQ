@@ -60,16 +60,17 @@ $user = Factory::getUser();
                 </div>
             </div>
 
-            <div v-if="VisibleRelationshipTypes.length" class="mt-4">
+            <div v-if="VisibleRelationshipGroups.length" class="mt-4">
                 <strong>Relationships:</strong>
-                <div class="mt-2">
-                    <div v-for="(rel, idx) in VisibleRelationshipTypes" :key="rel.name" class="form-check">
+                <div v-for="group in VisibleRelationshipGroups" :key="group.key" class="mt-2">
+                    <div class="text-muted" style="font-size:0.8rem;">{{ group.title }}</div>
+                    <div v-for="(rel, idx) in group.types" :key="rel.name" class="form-check">
                         <input type="checkbox"
                                class="form-check-input"
                                v-model="rel.included"
                                @change="RebuildAndRender"
-                               :id="`rel_chk_${idx}`">
-                        <label class="form-check-label" :for="`rel_chk_${idx}`">
+                               :id="`rel_chk_${group.key}_${idx}`">
+                        <label class="form-check-label" :for="`rel_chk_${group.key}_${idx}`">
                             {{ rel.name }}
                         </label>
                     </div>
@@ -133,6 +134,7 @@ $user = Factory::getUser();
                     <th scope="col">Link Type</th>
                     <th scope="col">From Type</th>
                     <th scope="col">To Type</th>
+                    <th scope="col">To Kind</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -141,6 +143,7 @@ $user = Factory::getUser();
                         <td>{{aLink.linkTypeName}}</td>
                         <td>{{aLink.subjectTypeName}}</td>
                         <td>{{aLink.objectTypeName}}</td>
+                        <td>{{aLink.objectIsType ? "Type" : "Instance"}}</td>
                     </tr>
                 </tbody>
             </table>
@@ -182,14 +185,17 @@ $user = Factory::getUser();
         },
         computed: {
             ExistingLinksByCountDesc: function(){
-                return this.existingLinks.sort((a,b)=>a.count <= b.count ? 1 : -1);
+                // copy before sorting — the DOT builder relies on the
+                // insertion order of `existingLinks`, and Array.sort mutates
+                return [...this.existingLinks].sort((a,b)=>a.count <= b.count ? 1 : -1);
             },
             // restrict the relationships sidebar to types that actually appear
-            // inside the currently-selected root subtrees. The underlying
+            // inside the currently-selected root subtrees, split into sections
+            // by what sits at the object end of the link. The underlying
             // `relationshipTypes` array still holds every type the model has
             // ever exposed, so a user's checkbox state survives roots toggling
             // off and back on.
-            VisibleRelationshipTypes: function(){
+            VisibleRelationshipGroups: function(){
                 if(!this.relationshipTypes.length) return [];
 
                 let includedRoots = new Set(
@@ -200,22 +206,46 @@ $user = Factory::getUser();
                         .filter(o => o.fqn && o.fqn.length > 0 && includedRoots.has(o.fqn[0]))
                         .map(o => o.id)
                 );
+                let typeIds = new Set(this.types.map(t => t.id));
 
-                let presentRels = new Set();
-                // "Contains" is synthesized from partOf — present whenever any
-                // object survives the root filter
+                // which object-end kinds each relationship type actually shows
+                // in scope. A set rather than a single value because nothing in
+                // the schema stops a type from doing both — "Can Use Sighting
+                // Type" is all-type today, but that's data, not a guarantee.
+                let objectEndKinds = new Map();
+                // "Contains" is synthesized from partOf, so it is always
+                // instance -> instance, and present whenever any object
+                // survives the root filter
                 if(filteredObjectIds.size > 0){
-                    presentRels.add("Contains");
+                    objectEndKinds.set("Contains", new Set(["instance"]));
                 }
                 this.links.forEach(r => {
                     if(!filteredObjectIds.has(r.subjectId)) return;
-                    if(!filteredObjectIds.has(r.objectId)) return;
-                    if(r.relationshipType && r.relationshipType.displayName){
-                        presentRels.add(r.relationshipType.displayName);
+                    let relName = r.relationshipType ? r.relationshipType.displayName : null;
+                    if(!relName) return;
+                    // a type end is always in scope, since types are global
+                    let kind = filteredObjectIds.has(r.objectId) ? "instance"
+                             : (typeIds.has(r.objectId) ? "type" : null);
+                    if(kind == null) return;
+                    if(!objectEndKinds.has(relName)){
+                        objectEndKinds.set(relName, new Set());
                     }
+                    objectEndKinds.get(relName).add(kind);
                 });
 
-                return this.relationshipTypes.filter(rt => presentRels.has(rt.name));
+                let groups = [
+                    { key: "instance", title: "Instance → Instance", types: [] },
+                    { key: "type",     title: "Instance → Type",     types: [] },
+                    { key: "mixed",    title: "Mixed",               types: [] }
+                ];
+                this.relationshipTypes.forEach(rt => {
+                    let kinds = objectEndKinds.get(rt.name);
+                    if(!kinds) return;   // not present in the selected roots
+                    let key = kinds.size > 1 ? "mixed" : (kinds.has("type") ? "type" : "instance");
+                    groups.find(g => g.key == key).types.push(rt);
+                });
+
+                return groups.filter(g => g.types.length > 0);
             }
         },
         methods: {
@@ -290,6 +320,102 @@ $user = Factory::getUser();
                 this.RebuildAndRender();
             },
 
+            TypeDisplayName: function(typeId){
+                let aType = this.types.find(x => x.id == typeId);
+                return aType ? aType.displayName : typeId;
+            },
+
+            // resolve the object end of a relationship. Most relationship
+            // types link instance -> instance, but some — "Can Use Sighting
+            // Type" being the case that surfaced this — link an instance
+            // straight at a *type*: the objectId resolves against tiqTypes,
+            // not objects. Those used to be dropped silently, because the
+            // instance lookup came up empty. Returns null when the end falls
+            // outside the selected roots (or can't be resolved at all).
+            ResolveObjectEnd: function(objectId, filteredObjectIds){
+                let aObject = this.objects.find(x => x.id == objectId);
+                if(aObject != null){
+                    if(!filteredObjectIds.has(aObject.id)) return null;
+                    return {
+                        typeRelativeName : aObject.typeName,
+                        typeName : this.TypeDisplayName(aObject.typeId),
+                        isType : false
+                    };
+                }
+                // types are global, so a type end is always in scope
+                let aType = this.types.find(x => x.id == objectId);
+                if(aType == null) return null;
+                return {
+                    // prefix keeps the aggregation key from colliding with an
+                    // instance-side typeName that happens to read the same
+                    typeRelativeName : `#type:${aType.id}`,
+                    typeName : aType.displayName,
+                    isType : true
+                };
+            },
+
+            _DotEscape: function(value){
+                return String(value == null ? "" : value)
+                    .replace(/\\/g, "\\\\")
+                    .replace(/"/g, '\\"');
+            },
+
+            // render `existingLinks` as readable DOT — one edge per line,
+            // grouped into a commented section per link type, so the Copy
+            // GViz output can be pasted somewhere and actually read
+            _BuildDot: function(){
+                let lines = [
+                    "digraph G {",
+                    "    graph [rankdir=TB]",
+                    '    node  [shape=ellipse, fontname="Helvetica", fontsize=11]',
+                    '    edge  [fontname="Helvetica", fontsize=10]'
+                ];
+
+                // section order follows first appearance, which puts the
+                // Contains backbone first and the relationships after it
+                let linkTypeNames = [];
+                this.existingLinks.forEach(aLink => {
+                    if(!linkTypeNames.includes(aLink.linkTypeName)){
+                        linkTypeNames.push(aLink.linkTypeName);
+                    }
+                });
+
+                linkTypeNames.forEach(linkTypeName => {
+                    let sectionLinks = this.existingLinks.filter(x => x.linkTypeName == linkTypeName);
+                    lines.push("");
+                    lines.push(`    // ${linkTypeName}`);
+                    sectionLinks.forEach(aLink => {
+                        let label = this._DotEscape(`${aLink.linkTypeName} (${aLink.count})`);
+                        let attributes = [`label="${label}"`];
+                        if(aLink.linkTypeName == "Contains"){
+                            // containment is the skeleton of the drawing, so
+                            // weight it: dot keeps weighted edges short and
+                            // straight, and the tree comes out as the spine
+                            attributes.push("weight=8");
+                        } else {
+                            // every other link type is an overlay on that tree.
+                            // Letting them constrain rank assignment is what
+                            // used to stretch the graph — "Made Sighting" spans
+                            // seven full ranks, so dot shoved those edges out to
+                            // the canvas margins to get around the nodes in
+                            // between. Unconstrained, they're drawn where they
+                            // fall without distorting the hierarchy.
+                            attributes.push("constraint=false");
+                        }
+                        // dashed purple with a hollow head marks an instance ->
+                        // type reference: the head of the arrow is the type
+                        // itself, not a set of instances of it
+                        if(aLink.objectIsType){
+                            attributes.push("style=dashed", 'color="#7b1fa2"', 'fontcolor="#7b1fa2"', "arrowhead=onormal");
+                        }
+                        lines.push(`    "${this._DotEscape(aLink.subjectTypeName)}" -> "${this._DotEscape(aLink.objectTypeName)}" [${attributes.join(", ")}]`);
+                    });
+                });
+
+                lines.push("}");
+                return lines.join("\n");
+            },
+
             _buildCleanSvg: function(){
                 // produce a detached SVG clone suitable for export — strips
                 // the inline screen-fit style so natural viewBox dimensions
@@ -347,13 +473,14 @@ $user = Factory::getUser();
             },
 
             DownloadCsv: function(){
-                let rows = [["Count", "Link Type", "From Type", "To Type"]];
+                let rows = [["Count", "Link Type", "From Type", "To Type", "To Kind"]];
                 this.ExistingLinksByCountDesc.forEach(link => {
                     rows.push([
                         link.count,
                         link.linkTypeName,
                         link.subjectTypeName,
-                        link.objectTypeName
+                        link.objectTypeName,
+                        link.objectIsType ? "Type" : "Instance"
                     ]);
                 });
                 // RFC 4180-ish escaping — quote any cell with commas, quotes,
@@ -457,10 +584,11 @@ $user = Factory::getUser();
                         if(existingLink==null){
                             this.existingLinks.push({
                                 subjectTypeRelativeName : aObject.partOf == null ? "root" : aObject.partOf.typeName,
-                                subjectTypeName : aObject.partOf == null ? "Root" : this.types.find(x=>x.id==aObject.partOf.typeId).displayName,
+                                subjectTypeName : aObject.partOf == null ? "Root" : this.TypeDisplayName(aObject.partOf.typeId),
                                 objectTypeRelativeName : aObject.typeName,
-                                objectTypeName : this.types.find(x=>x.id==aObject.typeId).displayName,
+                                objectTypeName : this.TypeDisplayName(aObject.typeId),
                                 linkTypeName : "Contains",
+                                objectIsType : false,
                                 count : 1
                             });
                         } else {
@@ -474,23 +602,24 @@ $user = Factory::getUser();
                 // whose type the user has switched off
                 this.links.forEach(aRelationship => {
                     if(!filteredObjectIds.has(aRelationship.subjectId)) return;
-                    if(!filteredObjectIds.has(aRelationship.objectId)) return;
                     let relName = aRelationship.relationshipType ? aRelationship.relationshipType.displayName : null;
                     if(!relName || !includedRels.has(relName)) return;
                     let aSubject = this.objects.find(x=>x.id==aRelationship.subjectId);
-                    let aObject = this.objects.find(x=>x.id==aRelationship.objectId);
+                    let aObjectEnd = this.ResolveObjectEnd(aRelationship.objectId, filteredObjectIds);
+                    if(aObjectEnd == null) return;
                     let existingLink = this.existingLinks.find(x=>
                         x.subjectTypeRelativeName == aSubject.typeName &&
-                        x.objectTypeRelativeName == aObject.typeName &&
+                        x.objectTypeRelativeName == aObjectEnd.typeRelativeName &&
                         x.linkTypeName == relName
                     );
                     if(existingLink==null){
                         this.existingLinks.push({
                             subjectTypeRelativeName : aSubject.typeName,
-                            subjectTypeName : this.types.find(x=>x.id==aSubject.typeId).displayName,
-                            objectTypeRelativeName : aObject.typeName,
-                            objectTypeName : this.types.find(x=>x.id==aObject.typeId).displayName,
+                            subjectTypeName : this.TypeDisplayName(aSubject.typeId),
+                            objectTypeRelativeName : aObjectEnd.typeRelativeName,
+                            objectTypeName : aObjectEnd.typeName,
                             linkTypeName : relName,
+                            objectIsType : aObjectEnd.isType,
                             count : 1
                         });
                     } else {
@@ -501,11 +630,7 @@ $user = Factory::getUser();
                 // build digraph string — stash on the instance so Copy GViz
                 // can hand the user the exact source that produced what they
                 // see on screen
-                let diagram = "digraph G {";
-                this.existingLinks.forEach(aLink => {
-                    diagram += `"${aLink.subjectTypeName}" -> "${aLink.objectTypeName}" [label="${aLink.linkTypeName} (${aLink.count})"]`;
-                });
-                diagram += "}";
+                let diagram = this._BuildDot();
                 this.diagram = diagram;
 
                 // render diagram — reusing the cached d3-graphviz instance on
